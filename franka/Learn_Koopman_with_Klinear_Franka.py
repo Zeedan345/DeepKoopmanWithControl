@@ -32,19 +32,34 @@ class data_collecter():
         self.reset_joint_state = np.array(self.env.reset_joint_state)
 
     def collect_koopman_data(self,traj_num,steps):
+        Kp = 2.0
+        Kd = 0.1
         train_data = np.empty((steps+1,traj_num,self.Nstates+self.udim))
         for traj_i in range(traj_num):
+            q_goal = np.random.uniform(self.env.joint_low, self.env.joint_high)
+            
             noise = (np.random.rand(7)-0.5)*2*0.2
+
             joint_init = self.reset_joint_state+noise
             joint_init = np.clip(joint_init,self.env.joint_low,self.env.joint_high)
+
             s0 = self.env.reset_state(joint_init)
             s0 = Obs(s0)
-            u10 = (np.random.rand(7)-0.5)*2*self.uval
+            
+            #u10 = (np.random.rand(7)-0.5)*2*self.uval
+            u10 = np.zeros(self.udim)
             train_data[0,traj_i,:]=np.concatenate([u10.reshape(-1),s0.reshape(-1)],axis=0).reshape(-1)
             for i in range(1,steps+1):
+                full_s = self.env.get_state()
+                q = full_s[6:13]
+                qd = full_s[13:20]
+
+                u10 = Kp * (q_goal - q) - Kd * qd
+                u10 = np.clip(u10, -self.env.sat_val, self.env.sat_val)
+
                 s0 = self.env.step(u10)
                 s0 = Obs(s0)
-                u10 = (np.random.rand(7)-0.5)*2*self.uval
+                #u10 = (np.random.rand(7)-0.5)*2*self.uval
                 train_data[i,traj_i,:]=np.concatenate([u10.reshape(-1),s0.reshape(-1)],axis=0).reshape(-1)
         return train_data
         
@@ -55,112 +70,127 @@ def gaussian_init_(n_units, std=1):
     return Omega
     
 class Network(nn.Module):
-    def __init__(self,encode_layers,Nkoopman,u_input_dim):
+    def __init__(self,encode_layers,bilinear_layers,Nkoopman,u_dim, encode_dim):
         super(Network,self).__init__()
-        Layers = OrderedDict()
+        #First We need the VAE encoder for state
+        ELayers = OrderedDict()
         for layer_i in range(len(encode_layers)-1):
-            Layers["linear_{}".format(layer_i)] = nn.Linear(encode_layers[layer_i],encode_layers[layer_i+1])
+            ELayers["linear_{}".format(layer_i)] = nn.Linear(encode_layers[layer_i],encode_layers[layer_i+1])
             if layer_i != len(encode_layers)-2:
-                Layers["relu_{}".format(layer_i)] = nn.ReLU()
-        self.encode_net = nn.Sequential(Layers)
+                ELayers["relu_{}".format(layer_i)] = nn.ReLU()
+        self.encode_net = nn.Sequential(ELayers)
+        #self.state_fc_mu = nn.Linear(encode_layers[-1], encode_dim)
+        #self.state_fc_logvar = nn.Linear(encode_layers[-1], encode_dim)
+        #VAE decoder for state
+        DLayers = OrderedDict()
+        dims = [encode_dim] + encode_layers[1:] + [encode_layers[0]]
+        for i in range(len(dims)-1):
+            DLayers[f"linear_{i}"] = nn.Linear(dims[i], dims[i+1])
+            if i < len(dims)-2:
+                DLayers[f"relu_{i}"] = nn.ReLU()
+        self.decode_net = nn.Sequential(DLayers)
+
+
+        BELayers = OrderedDict()
+        for layer_i in range(len(bilinear_layers)-1):
+            BELayers["linear_{}".format(layer_i)] = nn.Linear(bilinear_layers[layer_i],bilinear_layers[layer_i+1])
+            if layer_i != len(bilinear_layers)-2:
+                BELayers["relu_{}".format(layer_i)] = nn.ReLU()
+        self.bilinear_net = nn.Sequential(BELayers)  
+        self.control_fc_mu = nn.Linear(bilinear_layers[-1], u_dim)
+        self.control_fc_logvar = nn.Linear(bilinear_layers[-1], u_dim)
+
+        BDLayers = OrderedDict()
+        uddims = bilinear_layers + [u_dim]
+        for layer_i in range(len(uddims)-1):
+            BDLayers["linear_{}".format(layer_i)] = nn.Linear(uddims[layer_i],uddims[layer_i+1])
+            if layer_i != len(bilinear_layers)-2:
+                BDLayers["relu_{}".format(layer_i)] = nn.ReLU()
+        self.control_decode_net = nn.Sequential(BDLayers)
+
         self.Nkoopman = Nkoopman
-        self.u_input_dim = u_input_dim
+        self.u_dim = u_dim
         self.lA = nn.Linear(Nkoopman,Nkoopman,bias=False)
         self.lA.weight.data = gaussian_init_(Nkoopman, std=1)
         U, _, V = torch.svd(self.lA.weight.data)
         self.lA.weight.data = torch.mm(U, V.t()) * 0.9
-        self.lB = nn.Linear(u_input_dim,Nkoopman,bias=False)
+        self.lB = nn.Linear(u_dim,Nkoopman,bias=False)
 
-    def encode(self,x):
+    def encode_state(self,x):
+        #h = self.encode_net(x)
+        #mu = self.state_fc_mu(h)
+        #logvar = self.state_fc_logvar(h)
+        #z = self.reparameterize(mu, logvar)
+        # encoded_state = torch.cat([x, z],axis=-1)
+        # return encoded_state
         return torch.cat([x,self.encode_net(x)],axis=-1)
     
-    def forward(self,x,u):
-        return self.lA(x)+self.lB(u)
+    def decode_state(self,encoded_state):
+        return self.decode_net(encoded_state)
     
-
-class VAENetwork(nn.Module):
-    def __init__(self, state_dim, u_dim, u_out_dim, hidden_dim=128):
-        super(VAENetwork, self).__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(state_dim + u_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
-        self.fc_mu = nn.Linear(hidden_dim, u_out_dim)
-        self.fc_logvar = nn.Linear(hidden_dim, u_out_dim)
-        self.decoder = nn.Sequential(
-            nn.Linear(state_dim + u_out_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, u_dim)
-        )
-        # self.A = nn.Linear(latent_dim, latent_dim, bias=False)
-        # self.B = nn.Linear(u_dim, latent_dim, bias=False)
-
-        # self.A.weight.data = gaussian_init_(latent_dim, std=1)
-        # U, _, V = torch.svd(self.A.weight.data)
-        # self.A.weight.data = torch.mm(U, V.t()) * 0.9
-
-    def encode(self, x, u):
-        xu = torch.cat([x, u], dim=-1)
-        h = self.encoder(xu)
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
-        return mu, logvar
-
+    def decode_control(self, x, u_hat):
+        return self.control_decode_net(torch.cat([x, u_hat], axis = -1))
+    
+    def bicode(self,x,u):
+        x_all = torch.cat([x,u],axis=-1)
+        h = self.bilinear_net(x_all)
+        mu = self.control_fc_mu(h)
+        logvar = self.control_fc_logvar(h)
+        encoded_control = self.reparameterize(mu, logvar)
+        return encoded_control, mu, logvar
+    
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
-
-    def decode(self, x, u_hat):
-        xu_hat = torch.cat([x, u_hat], dim=-1)
-        return self.decoder(xu_hat)
-
-    def forward(self, x, u):
-        mu, logvar = self.encode(x, u)
-        u_hat = self.reparameterize(mu, logvar)
-        u_recon = self.decode(x, u_hat)
-        return u_recon, mu, logvar, u_hat
     
 
-#loss function
-def Klinear_loss(data, net, control_net, mse_loss, u_dim=1, gamma=0.99, Nstate=4, all_loss=0, vae_weight=1.0, kl_weight=1.0):
-    steps, train_traj_num, _ = data.shape
+    def forward(self,x,b):
+        return self.lA(x)+self.lB(b)
+    
+def Klinear_loss(data,net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=0,detach=0):
+    steps,train_traj_num,NKoopman = data.shape
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = torch.DoubleTensor(data).to(device)
-    X_current = net.encode(data[0, :, u_dim:])  # Initial lifted state z0
+    X_current = net.encode_state(data[0,:,u_dim:])
     beta = 1.0
     beta_sum = 0.0
-    koopman_loss = torch.zeros(1, dtype=torch.float64).to(device)
-    vae_loss = torch.zeros(1, dtype=torch.float64).to(device)
-    
-    for i in range(steps - 1):
-        s_i = data[i, :, u_dim:]
-        u_i = data[i, :, :u_dim]
-        u_recon_i, mu_i, logvar_i, u_hat_i = control_net(s_i, u_i)
-        step_vae, _, _ = Control_VAE_Loss(u_i, u_recon_i, mu_i, logvar_i, kl_weight)
-        vae_loss += beta * step_vae
-        X_current = net.forward(X_current, u_hat_i)
-        if not all_loss:
-            koopman_loss += beta * mse_loss(X_current[:, :Nstate], data[i + 1, :, u_dim:])
-        else:
-            Y = net.encode(data[i + 1, :, u_dim:])
-            koopman_loss += beta * mse_loss(X_current, Y)
+    loss = torch.zeros(1,dtype=torch.float64).to(device)
+    Augloss = torch.zeros(1,dtype=torch.float64).to(device)
+    #vae_loss = torch.zeros(1, dtype=torch.float64, device=device)
+    control_vaeloss = torch.zeros(1, dtype=torch.float64, device=device)
+    for i in range(steps-1):
+        bilinear, u_mu, u_logvar = net.bicode(X_current[:,:Nstate],data[i,:,:u_dim])
+        X_current = net.forward(X_current,bilinear)
         beta_sum += beta
+        if not all_loss:
+            loss += beta*mse_loss(X_current[:,:Nstate],data[i+1,:,u_dim:])
+        else:
+            Y = net.encode_state(data[i+1,:,u_dim:])
+            loss += beta*mse_loss(X_current,Y)
+        X_current_encoded = net.encode_state(X_current[:,:Nstate])
+        #x_step_loss = State_VAE_Loss(data[i+1, :, u_dim:], net.decode_state(z_next), x_mu_next, x_logvar_next)
+        #vae_loss += beta*x_step_loss
+        u_step_loss, _, _ = Control_VAE_Loss(data[i,:,:u_dim], net.decode_control(data[i,:,u_dim:], bilinear), u_mu, u_logvar)
+        control_vaeloss += beta*u_step_loss
+        Augloss += mse_loss(X_current_encoded,X_current)
         beta *= gamma
-    
-    koopman_loss = koopman_loss / beta_sum
-    vae_loss = vae_loss / beta_sum
-    total_loss = koopman_loss + vae_weight * vae_loss
-    return total_loss, koopman_loss, vae_loss
+    loss = loss/beta_sum
+    Augloss = Augloss/beta_sum
+    #vae_loss = vae_loss/beta_sum
+    control_vaeloss = control_vaeloss/beta_sum
+    return loss+0.5*Augloss + 0.4*control_vaeloss, Augloss, control_vaeloss
 
 
-def Control_VAE_Loss(u, u_recon, mu, logvar, kl_weight = 1.0):
+def State_VAE_Loss(u, u_recon, mu, logvar, kl_weight = 1.0):
+    #recon_loss = F.mse_loss(u_recon, u, reduction="mean")
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+    kl_loss = torch.mean(kl_loss)
+    total_vae_loss = kl_weight * kl_loss
+    #total_vae_loss = recon_loss + kl_weight * kl_loss
+    return total_vae_loss
+
+def Control_VAE_Loss(u, u_recon, mu, logvar, kl_weight = 0.4):
     recon_loss = F.mse_loss(u_recon, u, reduction="mean")
     kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
     kl_loss = torch.mean(kl_loss)
@@ -204,21 +234,23 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
     Nstate = in_dim
     layer_width = 128
     layers = [in_dim]+[layer_width]*layer_depth+[encode_dim]
+    blayers = [in_dim+u_dim]+[layer_width]*layer_depth
     Nkoopman = in_dim+encode_dim
     u_out_dim = u_dim
     print("layers:",layers)
-    net = Network(layers,Nkoopman,encode_dim)
-    control_net = VAENetwork(in_dim, u_dim, encode_dim)
+    net = Network(layers,blayers, Nkoopman,u_dim, encode_dim)
+    #control_net = VAENetwork(in_dim, u_dim, encode_dim)
     # print(net.named_modules())
     eval_step = 1000
     learning_rate = 1e-3
     if torch.cuda.is_available():
         net.cuda() 
-        control_net.cuda()
+        #control_net.cuda()
     net.double()
-    control_net.double()
+    #control_net.double()
     mse_loss = nn.MSELoss()
-    all_params = list(net.parameters()) + list(control_net.parameters())
+    #all_params = list(net.parameters()) + list(control_net.parameters())
+    all_params = list(net.parameters())
     optimizer = torch.optim.Adam(all_params,
                                     lr=learning_rate)
     # for name, param in all_params:
@@ -242,42 +274,45 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
         Kindex = list(range(Ktrain_samples))
         random.shuffle(Kindex)
         X = Ktrain_data[:,Kindex[:Kbatch_size],:]
-
-        total_loss, Kloss, vae_loss = Klinear_loss(X, net, control_net, mse_loss, u_dim, gamma, Nstate, all_loss, vae_weight, kl_weight)
+        Kloss, augloss, control_loss = Klinear_loss(X,net,mse_loss,u_dim,gamma,Nstate,all_loss)
         Eloss = Eig_loss(net)
-        
-        loss = total_loss+Eloss if e_loss else total_loss
+        loss = Kloss+Eloss if e_loss else Kloss
         optimizer.zero_grad()
         loss.backward()
         optimizer.step() 
         writer.add_scalar('Train/Kloss',Kloss,i)
-        writer.add_scalar('Train/VAEloss',vae_loss,i)
         writer.add_scalar('Train/Eloss',Eloss,i)
+        # writer.add_scalar('Train/Dloss',Dloss,i)
         writer.add_scalar('Train/loss',loss,i)
         # print("Step:{} Loss:{}".format(i,loss.detach().cpu().numpy()))
         if (i+1) % eval_step ==0:
             #K loss
-            total_loss, Kloss, vae_loss = Klinear_loss(X, net, control_net, mse_loss, u_dim, gamma, Nstate, all_loss, vae_weight, kl_weight)
-            Eloss = Eig_loss(net) 
-            loss = total_loss+Eloss if e_loss else total_loss
-            Kloss = Kloss.detach().cpu().numpy()
-            vae_loss = vae_loss.detach().cpu().numpy()
-            Eloss = Eloss.detach().cpu().numpy()
-            loss = loss.detach().cpu().numpy()
-            writer.add_scalar('Eval/Kloss',Kloss,i)
-            writer.add_scalar('Eval/VAEloss',vae_loss,i)
-            writer.add_scalar('Eval/Eloss',Eloss,i)
-            writer.add_scalar('Eval/loss',loss,i)
-            if loss<best_loss:
-                best_loss = loss
-                saved_dict = {
-                    'net_model': net.state_dict(),
-                    'control_net_model': control_net.state_dict(),
-                    'layer': layers
-                }
-                torch.save(saved_dict,"Data/"+subsuffix+".pth")
-            print("Step:{} Total-Eval-loss{} K-loss:{} E-loss:{} VAE-Loss{}".format(i,loss,Kloss,Eloss, vae_loss))
-            # print("-------------END-------------")
+            with torch.no_grad():
+                Kloss, augloss, control_loss = Klinear_loss(Ktest_data,net,mse_loss,u_dim,gamma,Nstate,all_loss=0)
+                Eloss = Eig_loss(net)
+                loss = Kloss
+                Kloss = Kloss.detach().cpu().numpy()
+                Eloss = Eloss.detach().cpu().numpy()
+                augloss = augloss.detach().cpu().numpy()
+                #vae_loss = vae_loss.detach().cpu().numpy()
+                control_loss = control_loss.detach().cpu().numpy()
+                # Dloss = Dloss.detach().cpu().numpy()
+                loss = loss.detach().cpu().numpy()
+                writer.add_scalar('Eval/Kloss',Kloss,i)
+                writer.add_scalar('Eval/Eloss',Eloss,i)
+                writer.add_scalar('Eval/best_loss',best_loss,i)
+                writer.add_scalar('Eval/loss',loss,i)
+                if loss<best_loss:
+                    best_loss = copy(Kloss)
+                    best_state_dict = copy(net.state_dict())
+                    Saved_dict = {'model':best_state_dict,'layer':layers,'blayer':blayers}
+                    torch.save(Saved_dict,logdir+".pth")
+                print("Step:{} Eval-loss{} K-loss:{} Augloss{} Control_Loss {}".format(i,loss,Kloss, augloss, control_loss))
+                # print("-------------END-------------")
+        writer.add_scalar('Eval/best_loss',best_loss,i)
+        # if (time.process_time()-start_time)>=210*3600:
+        #     print("time out!:{}".format(time.clock()-start_time))
+        #     break
     print("END-best_loss{}".format(best_loss))
     
 
