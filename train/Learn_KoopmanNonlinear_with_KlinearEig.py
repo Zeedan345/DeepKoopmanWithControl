@@ -57,19 +57,19 @@ class Network(nn.Module):
         x = torch.bmm(A_curr, x.unsqueeze(-1)).squeeze(-1)
         b = torch.bmm(B_curr, b.unsqueeze(-1)).squeeze(-1)
         return x + b
-
+        #return A_curr.dot(x) + B_curr.dot(b)
 class PieceWise(nn.Module):
     def __init__(self, z_dim, u_dim):
         super(PieceWise, self).__init__()
         self.A_net = nn.Sequential(
-            nn.Linear(z_dim, z_dim*z_dim),
+            nn.Linear(z_dim, 64),
             nn.ReLU(),
-            nn.Linear(z_dim*z_dim, z_dim*z_dim)
+            nn.Linear(64, z_dim*z_dim)
         )
         self.B_net = nn.Sequential(
-            nn.Linear(z_dim, z_dim*u_dim),
+            nn.Linear(z_dim, 64),
             nn.ReLU(),
-            nn.Linear(z_dim*u_dim, z_dim*u_dim)
+            nn.Linear(64, z_dim*u_dim)
         )
         self.z_dim = z_dim
         self.u_dim = u_dim
@@ -83,7 +83,7 @@ class PieceWise(nn.Module):
     
 def K_loss(data,net,u_dim=1,Nstate=4):
     steps,train_traj_num,Nstates = data.shape
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = next(net.parameters()).device
     data = torch.DoubleTensor(data).to(device)
     X_current = net.encode(data[0,:,u_dim:])
     max_loss_list = []
@@ -110,7 +110,7 @@ def Klinear_loss(data,net, pw_net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=
     loss = torch.zeros(1,dtype=torch.float64).to(device)
     Augloss = torch.zeros(1,dtype=torch.float64).to(device)
     for i in range(steps-1):
-        bilinear = net.bicode(X_current[:,:Nstate].detach(),data[i,:,:u_dim]) #detach's problem 
+        bilinear = net.bicode(X_current[:,:Nstate],data[i,:,:u_dim]) #detach's problem 
         X_current = net.forward(X_current,bilinear, A_curr, B_curr)
         beta_sum += beta
         if not all_loss:
@@ -119,7 +119,7 @@ def Klinear_loss(data,net, pw_net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=
             Y = net.encode(data[i+1,:,u_dim:])
             loss += beta*mse_loss(X_current,Y)
         X_current_encoded = net.encode(X_current[:,:Nstate])
-        if(i%5 == 0):
+        if(i%2 == 0):
             z_ref = X_current_encoded.clone().detach()
             A_curr, B_curr = pw_net(z_ref)
         Augloss += mse_loss(X_current_encoded,X_current)
@@ -142,6 +142,7 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
                 detach = 0,Ktrain_samples=50000):
     # Ktrain_samples = 1000
     # Ktest_samples = 1000    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     Ktrain_samples = Ktrain_samples
     Ktest_samples = 20000
     Ksteps = 15
@@ -168,13 +169,16 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
     # print(net.named_modules())
     eval_step = 1000
     learning_rate = 1e-3
-    if torch.cuda.is_available():
-        net.cuda() 
-        pw_net.cuda()
+    # if torch.cuda.is_available():
+    #     net.cuda() 
+    #     pw_net.cuda()
+    net.to(device)
+    pw_net.to(device)
     net.double()
     pw_net.double()
     mse_loss = nn.MSELoss()
-    optimizer = torch.optim.Adam(net.parameters(),
+    params = list(net.parameters()) + list(pw_net.parameters())
+    optimizer = torch.optim.Adam(params,
                                     lr=learning_rate)
     for name, param in net.named_parameters():
         print("model:",name,param.requires_grad)

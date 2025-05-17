@@ -74,26 +74,60 @@ class Network(nn.Module):
     def encode(self,x):
         return torch.cat([x,self.encode_net(x)],axis=-1)
     
-    def forward(self,x,u):
-        return self.lA(x)+self.lB(u)
+    def forward(self,x,b, A_curr, B_curr):
+        # return self.lA(x)+self.lB(u)
+        x = torch.bmm(A_curr, x.unsqueeze(-1)).squeeze(-1)
+        b = torch.bmm(B_curr, b.unsqueeze(-1)).squeeze(-1)
+        return x + b
+class PieceWise(nn.Module):
+    def __init__(self, z_dim, u_dim, hidden_layer = 64):
+        super(PieceWise, self).__init__()
+        self.A_net = nn.Sequential(
+            nn.Linear(z_dim, hidden_layer),
+            nn.ReLU(),
+            nn.Linear(hidden_layer, z_dim*z_dim)
+        )
+        self.B_net = nn.Sequential(
+            nn.Linear(z_dim, hidden_layer),
+            nn.ReLU(),
+            nn.Linear(hidden_layer, z_dim*u_dim)
+        )
+        self.z_dim = z_dim
+        self.u_dim = u_dim
+
+    def forward(self, z):
+        A_flat = self.A_net(z)
+        B_flat = self.B_net(z)
+        A = A_flat.view(-1, self.z_dim, self.z_dim)
+        B = B_flat.view(-1, self.z_dim, self.u_dim)
+        return A, B
 
 #loss function
-def Klinear_loss(data,net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=0):
+def Klinear_loss(data,net, pw_net, mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=0):
     steps,train_traj_num,NKoopman = data.shape
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = torch.DoubleTensor(data).to(device)
     X_current = net.encode(data[0,:,u_dim:])
+    z_ref = X_current.clone().detach()
+    A_curr, B_curr = pw_net(z_ref)
     beta = 1.0
     beta_sum = 0.0
     loss = torch.zeros(1,dtype=torch.float64).to(device)
     for i in range(steps-1):
-        X_current = net.forward(X_current,data[i,:,:u_dim])
+        X_current = net.forward(X_current,data[i,:,:u_dim], A_curr, B_curr)
+        if(i%2 == 0):
+            z_ref = X_current.clone().detach()
+            A_curr, B_curr = pw_net(z_ref)
         beta_sum += beta
         if not all_loss:
             loss += beta*mse_loss(X_current[:,:Nstate],data[i+1,:,u_dim:])
         else:
             Y = net.encode(data[i+1,:,u_dim:])
             loss += beta*mse_loss(X_current,Y)
+        X_current_encoded = net.encode(X_current[:,:Nstate])
+        if(i%2 == 0):
+            z_ref = X_current_encoded.clone().detach()
+            A_curr, B_curr = pw_net(z_ref)
         beta *= gamma
     loss = loss/beta_sum
     return loss
@@ -138,14 +172,18 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
     Nkoopman = in_dim+encode_dim
     print("layers:",layers)
     net = Network(layers,Nkoopman,u_dim)
+    pw_net = PieceWise(Nkoopman, u_dim)
     # print(net.named_modules())
     eval_step = 1000
     learning_rate = 1e-3
     if torch.cuda.is_available():
         net.cuda() 
+        pw_net.cuda()
     net.double()
+    pw_net.double()
     mse_loss = nn.MSELoss()
-    optimizer = torch.optim.Adam(net.parameters(),
+    params = list(net.parameters()) + list(pw_net.parameters())
+    optimizer = torch.optim.Adam(params,
                                     lr=learning_rate)
     for name, param in net.named_parameters():
         print("model:",name,param.requires_grad)
@@ -165,7 +203,7 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
         Kindex = list(range(Ktrain_samples))
         random.shuffle(Kindex)
         X = Ktrain_data[:,Kindex[:Kbatch_size],:]
-        Kloss = Klinear_loss(X,net,mse_loss,u_dim,gamma,Nstate,all_loss)
+        Kloss = Klinear_loss(X,net,pw_net, mse_loss,u_dim,gamma,Nstate,all_loss)
         Eloss = Eig_loss(net)
         loss = Kloss+Eloss if e_loss else Kloss
         optimizer.zero_grad()
@@ -177,7 +215,7 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
         # print("Step:{} Loss:{}".format(i,loss.detach().cpu().numpy()))
         if (i+1) % eval_step ==0:
             #K loss
-            Kloss = Klinear_loss(Ktest_data,net,mse_loss,u_dim,gamma,Nstate,all_loss)
+            Kloss = Klinear_loss(Ktest_data,net,pw_net, mse_loss,u_dim,gamma,Nstate,all_loss)
             Eloss = Eig_loss(net)
             loss = Kloss+Eloss if e_loss else Kloss
             Kloss = Kloss.detach().cpu().numpy()
