@@ -81,18 +81,24 @@ class PieceWise(nn.Module):
         B = B_flat.view(-1, self.z_dim, self.u_dim)
         return A, B
     
-def K_loss(data,net,u_dim=1,Nstate=4):
+def K_loss(data,net, pw_net,u_dim=1,Nstate=4):
     steps,train_traj_num,Nstates = data.shape
     device = next(net.parameters()).device
     data = torch.DoubleTensor(data).to(device)
     X_current = net.encode(data[0,:,u_dim:])
+    z_ref = X_current.clone().detach()
+    A_curr, B_curr = pw_net(z_ref)
     max_loss_list = []
     mean_loss_list = []
     for i in range(steps-1):
-        bilinear = net.bicode(X_current[:,:Nstate].detach(),data[i,:,:u_dim]) #detach's problem 
-        X_current = net.forward(X_current,bilinear)
+        bilinear = net.bicode(X_current[:,:Nstate],data[i,:,:u_dim]) #detach's problem 
+        X_current = net.forward(X_current,bilinear, A_curr, B_curr)
         Y = data[i+1,:,u_dim:]
         Err = X_current[:,:Nstate]-Y
+        X_current_encoded = net.encode(X_current[:,:Nstate])
+        if(i%2 == 0):
+            z_ref = X_current_encoded.clone().detach()
+            A_curr, B_curr = pw_net(z_ref)
         max_loss_list.append(torch.mean(torch.max(torch.abs(Err),axis=0).values).detach().cpu().numpy())
         mean_loss_list.append(torch.mean(torch.mean(torch.abs(Err),axis=0)).detach().cpu().numpy())
     return np.array(max_loss_list),np.array(mean_loss_list)
@@ -226,7 +232,8 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
                 if loss<best_loss:
                     best_loss = copy(Kloss)
                     best_state_dict = copy(net.state_dict())
-                    Saved_dict = {'model':best_state_dict,'layer':layers,'blayer':blayers}
+                    pw_state_dict = copy(pw_net.state_dict())
+                    Saved_dict = {'model':best_state_dict,'layer':layers,'blayer':blayers, "pw_state_dict": pw_state_dict}
                     torch.save(Saved_dict,logdir+".pth")
                 print("Step:{} Eval-loss{} K-loss:{}".format(i,loss,Kloss))
                 # print("-------------END-------------")
@@ -259,3 +266,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main()
 
+ 

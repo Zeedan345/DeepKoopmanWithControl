@@ -115,9 +115,6 @@ def Klinear_loss(data,net, pw_net, mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss
     loss = torch.zeros(1,dtype=torch.float64).to(device)
     for i in range(steps-1):
         X_current = net.forward(X_current,data[i,:,:u_dim], A_curr, B_curr)
-        if(i%2 == 0):
-            z_ref = X_current.clone().detach()
-            A_curr, B_curr = pw_net(z_ref)
         beta_sum += beta
         if not all_loss:
             loss += beta*mse_loss(X_current[:,:Nstate],data[i+1,:,u_dim:])
@@ -227,7 +224,8 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
             if loss<best_loss:
                 best_loss = copy(Kloss)
                 best_state_dict = copy(net.state_dict())
-                Saved_dict = {'model':best_state_dict,'layer':layers}
+                best_pw_dict = copy(pw_net.state_dict())
+                Saved_dict = {'model':best_state_dict,'layer':layers, 'pw_net_dict': best_pw_dict}
                 torch.save(Saved_dict,"Data/"+subsuffix+".pth")
             print("Step:{} Eval-loss{} K-loss:{} E-loss:{}".format(i,loss,Kloss,Eloss))
             # print("-------------END-------------")
