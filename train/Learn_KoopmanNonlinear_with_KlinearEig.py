@@ -59,26 +59,26 @@ class Network(nn.Module):
         return x + b
         #return A_curr.dot(x) + B_curr.dot(b)
 class PieceWise(nn.Module):
-    def __init__(self, z_dim, u_dim):
+    def __init__(self, x_dim, u_dim, hidden_dim = 32):
         super(PieceWise, self).__init__()
         self.A_net = nn.Sequential(
-            nn.Linear(z_dim, 64),
+            nn.Linear(x_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(64, z_dim*z_dim)
+            nn.Linear(hidden_dim, x_dim*x_dim)
         )
         self.B_net = nn.Sequential(
-            nn.Linear(z_dim, 64),
+            nn.Linear(x_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(64, z_dim*u_dim)
+            nn.Linear(hidden_dim, x_dim*u_dim)
         )
-        self.z_dim = z_dim
+        self.x_dim = x_dim
         self.u_dim = u_dim
 
     def forward(self, z):
         A_flat = self.A_net(z)
         B_flat = self.B_net(z)
-        A = A_flat.view(-1, self.z_dim, self.z_dim)
-        B = B_flat.view(-1, self.z_dim, self.u_dim)
+        A = A_flat.view(-1, self.x_dim, self.x_dim)
+        B = B_flat.view(-1, self.x_dim, self.u_dim)
         return A, B
     
 def K_loss(data,net, pw_net,u_dim=1,Nstate=4):
@@ -86,8 +86,9 @@ def K_loss(data,net, pw_net,u_dim=1,Nstate=4):
     device = next(net.parameters()).device
     data = torch.DoubleTensor(data).to(device)
     X_current = net.encode(data[0,:,u_dim:])
-    z_ref = X_current.clone().detach()
-    A_curr, B_curr = pw_net(z_ref)
+    #z_ref = X_current.clone().detach()
+    X0 = net.encode(data[0, :, u_dim:])
+    A_curr, B_curr = pw_net(X0)
     max_loss_list = []
     mean_loss_list = []
     for i in range(steps-1):
@@ -96,9 +97,10 @@ def K_loss(data,net, pw_net,u_dim=1,Nstate=4):
         Y = data[i+1,:,u_dim:]
         Err = X_current[:,:Nstate]-Y
         X_current_encoded = net.encode(X_current[:,:Nstate])
-        if(i%2 == 0):
-            z_ref = X_current_encoded.clone().detach()
-            A_curr, B_curr = pw_net(z_ref)
+        if(i%5 == 0):
+            #z_ref = X_current_encoded.clone().detach()
+            X_inc = net.encode(X_current[:, :Nstate])
+            A_curr, B_curr = pw_net(X_inc)
         max_loss_list.append(torch.mean(torch.max(torch.abs(Err),axis=0).values).detach().cpu().numpy())
         mean_loss_list.append(torch.mean(torch.mean(torch.abs(Err),axis=0)).detach().cpu().numpy())
     return np.array(max_loss_list),np.array(mean_loss_list)
@@ -109,12 +111,15 @@ def Klinear_loss(data,net, pw_net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = torch.DoubleTensor(data).to(device)
     X_current = net.encode(data[0,:,u_dim:])
-    z_ref = X_current.clone().detach()
-    A_curr, B_curr = pw_net(z_ref)
+    #z_ref = X_current.clone().detach()
+    X0 = net.encode(data[0, :, u_dim:])
+    A_curr, B_curr = pw_net(X0.detach())
+    Eloss = Pw_Eig_loss(A_curr)
     beta = 1.0
     beta_sum = 0.0
     loss = torch.zeros(1,dtype=torch.float64).to(device)
     Augloss = torch.zeros(1,dtype=torch.float64).to(device)
+    Eigloss = torch.zeros(1, dtype=torch.float64).to(device)
     for i in range(steps-1):
         bilinear = net.bicode(X_current[:,:Nstate],data[i,:,:u_dim]) #detach's problem 
         X_current = net.forward(X_current,bilinear, A_curr, B_curr)
@@ -125,14 +130,18 @@ def Klinear_loss(data,net, pw_net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=
             Y = net.encode(data[i+1,:,u_dim:])
             loss += beta*mse_loss(X_current,Y)
         X_current_encoded = net.encode(X_current[:,:Nstate])
-        if(i%2 == 0):
-            z_ref = X_current_encoded.clone().detach()
-            A_curr, B_curr = pw_net(z_ref)
+        if(i%5 == 0):
+            #z_ref = X_current_encoded.clone().detach()
+            X_inc = net.encode(X_current[:, :Nstate])
+            A_curr, B_curr = pw_net(X_inc.detach())
+            Eigloss += Pw_Eig_loss(A_curr)
         Augloss += mse_loss(X_current_encoded,X_current)
         beta *= gamma
     loss = loss/beta_sum
     Augloss = Augloss/beta_sum
-    return loss+0.5*Augloss
+    Eigloss = Eigloss/(steps - 1)
+
+    return loss+0.5*Augloss + Eloss
 
 
 def Eig_loss(net):
@@ -141,6 +150,15 @@ def Eig_loss(net):
     c = torch.linalg.eigvals(A).abs()-torch.ones(1,dtype=torch.float64).to(device)
     mask = c>0
     loss = c[mask].sum()
+    return loss
+
+def Pw_Eig_loss(A_matrix):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    eigvals = torch.linalg.eigvals(A_matrix)
+    c= eigvals.abs() - 1.0
+    mask = c>0
+
+    loss = torch.sum(c[mask])/A_matrix.size(0)
     return loss
 
 def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
